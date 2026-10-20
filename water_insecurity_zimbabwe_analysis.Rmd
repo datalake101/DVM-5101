@@ -1,0 +1,452 @@
+---
+title: "Water Insecurity and Perceptions of Government Performance in Zimbabwe"
+subtitle: "A cross-sectional analysis using Afrobarometer survey Round 10"
+author: "DVM 5101"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: false
+    number_sections: false
+---
+
+# Setup the environment
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# Install missing packages once if necessary:
+# install.packages(c("haven", "dplyr", "forcats", "labelled", "gtsummary",
+#                    "survey", "broom", "ggplot2", "flextable", "car"))
+
+required_packages <- c("haven", "dplyr", "forcats", "labelled", "gtsummary",
+                       "survey", "broom", "ggplot2", "flextable", "car", "broom.helpers")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages)) install.packages(missing_packages, repos = "https://cloud.r-project.org")
+
+library(haven)
+library(dplyr)
+library(forcats)
+library(labelled)
+library(gtsummary)
+library(survey)
+library(broom)
+library(ggplot2)
+library(flextable)
+library(car)
+```
+
+# Study objective
+
+This study looks at the relationship between water insecurity and people’s views on government performance in providing water and sanitation services in Zimbabwe.
+
+The analysis uses **Afrobarometer Round 10 Zimbabwe** data. The main exposure is **Q7B**, which asks how often the respondent or their family went without enough clean water for home use during the previous year. The main outcome is **Q47I**, which asks respondents to rate government performance in providing water and sanitation services.
+
+The file downloads the data directly from Afrobarometer. It first uses the SPSS file because this keeps the variable names and response labels. You do not need to save a CSV file on your computer.
+
+# Set up data
+
+```{r import-data}
+# data source: https://www.afrobarometer.org/survey-resource/zimbabwe-round-10-data-2024/
+sav_url <- "https://www.afrobarometer.org/wp-content/uploads/2025/11/ZIM_R10.Data_02Aug24.wtd_.final_.release_updated.13Feb25.sav"
+
+options(timeout = max(300, getOption("timeout")))
+df <- tryCatch(haven::read_sav(sav_url), error = function(e) {
+  message("SPSS download failed; trying the CSV source.")
+  read.csv(csv_url, check.names = FALSE)
+})
+names(df) <- toupper(trimws(names(df)))
+pick_var <- function(data, candidates, required = FALSE) {
+  hit <- candidates[candidates %in% names(data)]
+  if (!length(hit)) {
+    if (required) stop("Required variable not found: ", paste(candidates, collapse = ", "))
+    return(NA_character_)
+  }
+  hit[1]
+}
+# Use actual SPSS variable labels, not question numbers from another round.
+find_label <- function(pattern, fallback = character()) {
+  labs <- vapply(df, function(x) {
+    z <- attr(x, "label"); if (is.null(z)) "" else as.character(z)
+  }, character(1))
+  hit <- names(df)[grepl(pattern, labs, ignore.case = TRUE)]
+  if (length(hit) == 1) hit else pick_var(df, fallback)
+}
+water_var <- pick_var(df, "Q7B", TRUE)
+gov_var <- pick_var(df, "Q47I", TRUE)
+weight_var <- pick_var(df, c("WITHINWT_HH", "WITHINWT_EA", "WITHINWT"), TRUE)
+age_var <- find_label("^Q1[.] Age$", c("Q1", "AGE"))
+gender_var <- find_label("respondent.*gender|gender of respondent", c("GENDER", "SEX"))
+residence_var <- pick_var(df, "URBRUR")
+education_var <- find_label("highest.*education|education.*level|level.*education", "EDUCATION")
+province_var <- pick_var(df, c("REGION", "PROVINCE"))
+knitr::kable(data.frame(
+  Role = c("Age", "Gender", "Residence", "Education", "Province", "Weight"),
+  Source = c(age_var, gender_var, residence_var, education_var, province_var, weight_var)
+), format = "pipe", caption = "Detected source variables; NA means not included")
+cat("Imported observations:", nrow(df))
+```
+
+# Data preparation
+
+Afrobarometer uses separate codes for missing answers, refusals and responses such as “don’t know”. For the two main variables, only valid answers are included in the analysis.
+
+```{r recode-data}
+to_num <- function(x) {
+  if (is.numeric(x)) return(as.numeric(x))
+  suppressWarnings(as.numeric(as.character(x)))
+}
+clean_factor <- function(x) {
+  if (is.numeric(x)) {
+    x <- haven::zap_missing(x)
+    x[as.numeric(x) %in% c(-1, 8, 9, 98, 99, 998, 999, 9998, 9999)] <- NA
+  }
+  factor(haven::as_factor(x))
+}
+
+analysis <- df %>%
+  mutate(
+    water_raw = to_num(.data[[water_var]]),
+    gov_raw   = to_num(.data[[gov_var]]),
+
+    # Q7B substantive values: 0-4
+    water_insecurity = case_when(
+      water_raw == 0 ~ "Never",
+      water_raw == 1 ~ "Just once or twice",
+      water_raw == 2 ~ "Several times",
+      water_raw == 3 ~ "Many times",
+      water_raw == 4 ~ "Always",
+      TRUE ~ NA_character_
+    ),
+    water_insecurity = factor(
+      water_insecurity,
+      levels = c("Never", "Just once or twice", "Several times", "Many times", "Always"),
+      ordered = FALSE
+    ),
+
+    # Simple binary exposure for logistic-regression interpretation
+    water_insecure_binary = case_when(
+      water_raw == 0 ~ "No",
+      water_raw %in% 1:4 ~ "Yes",
+      TRUE ~ NA_character_
+    ),
+    water_insecure_binary = factor(water_insecure_binary, levels = c("No", "Yes")),
+
+    # Q47I substantive values: 1-4
+    gov_water_performance = case_when(
+      gov_raw == 1 ~ "Very badly",
+      gov_raw == 2 ~ "Fairly badly",
+      gov_raw == 3 ~ "Fairly well",
+      gov_raw == 4 ~ "Very well",
+      TRUE ~ NA_character_
+    ),
+    gov_water_performance = factor(
+      gov_water_performance,
+      levels = c("Very badly", "Fairly badly", "Fairly well", "Very well"),
+      ordered = TRUE
+    ),
+
+    # Binary outcome: positive government-performance assessment
+    gov_performance_positive = case_when(
+      gov_raw %in% c(1, 2) ~ "Badly",
+      gov_raw %in% c(3, 4) ~ "Well",
+      TRUE ~ NA_character_
+    ),
+    gov_performance_positive = factor(gov_performance_positive, levels = c("Badly", "Well"))
+  )
+
+# Add optional covariates from labelled data without assuming that every
+# Zimbabwe release uses exactly the same demographic column names.
+if (!is.na(age_var)) analysis$age <- ifelse(to_num(df[[age_var]]) %in% 18:120, to_num(df[[age_var]]), NA_real_)
+if (!is.na(gender_var)) analysis$gender <- clean_factor(df[[gender_var]])
+if (!is.na(residence_var)) analysis$residence <- clean_factor(df[[residence_var]])
+if (!is.na(education_var)) analysis$education <- clean_factor(df[[education_var]])
+if (!is.na(province_var)) analysis$province <- clean_factor(df[[province_var]])
+
+# Additional predictors chosen for substantive relevance, not p-values.
+# Q4A and Q4B: retain only substantive codes 1-5.
+condition_factor <- function(x) {
+  z <- to_num(x)
+  z[!z %in% 1:5] <- NA_real_
+  factor(z, levels = 1:5,
+         labels = c("Very bad", "Fairly bad", "Neither good nor bad", "Fairly good", "Very good"))
+}
+if ("Q4A" %in% names(df)) analysis$economic_conditions <- condition_factor(df$Q4A)
+if ("Q4B" %in% names(df)) analysis$living_conditions <- condition_factor(df$Q4B)
+
+# A study-specific deprivation score excluding water avoids putting the
+# exposure itself into the adjustment score. This is NOT the official LPI.
+poverty_items <- c("Q7A", "Q7C", "Q7D", "Q7E")
+if (all(poverty_items %in% names(df))) {
+  deprivation <- as.data.frame(lapply(df[poverty_items], function(x) {
+    z <- to_num(x)
+    z[!z %in% 0:4] <- NA_real_
+    z
+  }))
+  # Require all four answers; do not average different item sets.
+  analysis$nonwater_deprivation <- rowMeans(deprivation, na.rm = FALSE)
+}
+for (v in intersect(c("economic_conditions", "living_conditions", "nonwater_deprivation"), names(analysis))) {
+  attr(analysis[[v]], "label") <- switch(v,
+    economic_conditions = "National economic conditions",
+    living_conditions = "Personal living conditions",
+    nonwater_deprivation = "Non-water deprivation score (0-4)")
+}
+
+if (!is.na(weight_var)) {
+  analysis$weight <- to_num(df[[weight_var]])
+} else {
+  analysis$weight <- 1
+}
+
+analysis <- analysis %>%
+  mutate(weight = ifelse(is.finite(weight) & weight > 0, weight, NA_real_)) %>%
+  filter(!is.na(weight))
+# Weight-only design: no unverified PSU or stratum variables are invented.
+# Standard errors do not account for clustering or stratification.
+design <- survey::svydesign(ids = ~1, weights = ~weight, data = analysis)
+```
+
+# Table 1: Description of study variables
+
+```{r table1-variable-description}
+variable_description <- data.frame(
+  Variable = c(
+    "Water insecurity",
+    "Any water insecurity",
+    "Government performance: water and sanitation",
+    "Positive government performance"
+  ),
+  Afrobarometer_item = c("Q7B", "Derived from Q7B", "Q47I", "Derived from Q47I"),
+  Role = c("Main exposure", "Main exposure for binary model", "Main outcome", "Binary outcome for logistic model"),
+  Coding = c(
+    "Never; just once/twice; several times; many times; always",
+    "No = never; Yes = any experience of going without water",
+    "Very badly; fairly badly; fairly well; very well",
+    "Badly = very/fairly badly; Well = fairly/very well"
+  )
+)
+
+variable_description <- bind_rows(variable_description, data.frame(
+  Variable = c("National economic conditions", "Personal living conditions", "Non-water deprivation"),
+  Afrobarometer_item = c("Q4A", "Q4B", "Q7A, Q7C, Q7D, Q7E"),
+  Role = rep("Additional explanatory variable", 3),
+  Coding = c("Five categories: very bad to very good", "Five categories: very bad to very good",
+             "Mean of food, medical care, cooking fuel and cash-income deprivation (0-4); all four required")
+))
+variable_description %>%
+  flextable::flextable() %>%
+  flextable::set_caption("Table 1. Description of principal study variables") %>%
+  flextable::fontsize(size = 9, part = "all") %>%
+  flextable::set_table_properties(layout = "autofit", width = 1)
+```
+
+# Table 2: Descriptive statistics (unweighted)
+
+```{r table2-descriptive}
+desc_vars <- c(
+  "water_insecurity",
+  "water_insecure_binary",
+  intersect(c("age", "gender", "residence", "education", "province", "economic_conditions", "living_conditions", "nonwater_deprivation"), names(analysis))
+)
+
+analysis %>%
+  select(all_of(c("gov_performance_positive", desc_vars))) %>%
+  tbl_summary(
+    by = gov_performance_positive,
+    missing = "no",
+    percent = "column",
+    digits = all_categorical() ~ 1,
+    label = list(
+      water_insecurity ~ "Frequency of going without water",
+      water_insecure_binary ~ "Experienced water insecurity"
+    )
+  ) %>%
+  add_n() %>%
+  add_p() %>%
+  modify_header(label = "**Variable**") %>%
+  bold_labels() %>%
+  gtsummary::as_flex_table() %>%
+  flextable::set_table_properties(layout = "autofit", width = 1)
+```
+
+Table 2 compares respondents who rated government performance **badly** with those who rated it **well**.
+
+## Interpretation of descriptive results
+
+There were 1,200 respondents in the dataset. Of these, 1,192 gave a valid answer about government performance: 820 rated it badly and 372 rated it well. The percentages in Table 2 describe the people within each of these two groups. They do not show the percentage rating performance well within each water-insecurity category.
+
+Among respondents rating performance badly, 69.0% reported some water insecurity, compared with 38.4% among those rating performance well (unadjusted p < 0.001). Frequent shortages were particularly concentrated in the negative-assessment group: 23.9% reported going without water many times and 10.2% always, compared with 7.8% and 1.3%, respectively, in the positive-assessment group. Conversely, 61.6% of respondents rating performance well had never gone without water, compared with 31.0% of those rating performance badly.
+
+Median age was 36 years in both groups, and neither age nor gender showed clear unadjusted evidence of a difference (p > 0.9 and p = 0.6). Rural residents accounted for 66.4% of positive assessments and 52.9% of negative assessments. The distributions of residence and province differed between groups (both p < 0.001).
+
+Negative economic perceptions were more common among respondents rating government performance badly. Very bad national economic conditions were reported by 44.4% of the negative-assessment group and 27.2% of the positive-assessment group (overall p < 0.001). Very bad personal living conditions were reported by 42.3% and 30.1%, respectively (overall p = 0.001). Median non-water deprivation was also higher in the negative-assessment group: 1.75 (interquartile range 1.00-2.50), compared with 1.50 (0.75-2.00; p < 0.001).
+
+These comparisons do not use survey weights or account for other variables. They show differences in the sample, but they do not tell us what caused these differences.
+
+# Figure 1: Government performance by water insecurity
+
+```{r figure1, fig.width=9, fig.height=5.5}
+plot_data <- analysis %>%
+  filter(!is.na(water_insecurity), !is.na(gov_performance_positive)) %>%
+  count(water_insecurity, gov_performance_positive, wt = weight, name = "weighted_n") %>%
+  group_by(water_insecurity) %>%
+  mutate(percent = 100 * weighted_n / sum(weighted_n)) %>%
+  ungroup()
+
+ggplot(plot_data,
+       aes(x = water_insecurity, y = percent,
+           fill = gov_performance_positive)) +
+  geom_col(position = "stack") +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(
+    x = "Frequency of going without enough clean water",
+    y = "Weighted percentage",
+    fill = "Government performance",
+    title = "Perceptions of government water and sanitation performance",
+    subtitle = "By respondents' experience of water insecurity"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+# Analysis notes
+
+The additional predictors are national economic conditions (Q4A), personal living conditions (Q4B), and a study-specific non-water deprivation score calculated from Q7A, Q7C, Q7D and Q7E. These variables were included because they are relevant to the research question, not because they give significant results. Views about economic and living conditions may overlap with views about government performance. The model shows associations after adjustment, not causal effects.
+
+Table 2 is unweighted; Figure 1 uses within-country weights. The final regression uses survey weights with an independence working design (`ids = ~1`). Its uncertainty estimates do not account for clustering or stratification. Verify and specify the dataset's PSU and stratum fields before publication. Missing values are excluded by complete-case analysis; the model sample size is reported below. Optional predictors are left out if they are unavailable or have no variation. The final model formula is shown below.
+
+Source: [Afrobarometer Zimbabwe Round 10 codebook](https://www.afrobarometer.org/wp-content/uploads/2025/12/AB_R10.Codebook_Zimbabwe_02Dec25.pdf). No numerical findings are invented. Rendering has not been tested in this environment because R is unavailable.
+
+# Table 3: Binary logistic regression
+
+The regression estimates the odds of evaluating the government's performance on water and sanitation **well** (fairly well/very well) rather than **badly** (fairly badly/very badly). The principal exposure is whether a respondent experienced any water insecurity during the previous year.
+
+```{r model-data}
+# Select available adjustment variables.
+adjusters <- intersect(c("age", "gender", "residence", "education", "province", "economic_conditions", "living_conditions", "nonwater_deprivation"), names(analysis))
+
+model_data <- analysis %>%
+  filter(!is.na(gov_performance_positive), !is.na(water_insecure_binary))
+
+# Use a common complete-case sample for the specified model.
+model_data <- model_data[complete.cases(model_data[c("gov_performance_positive", "water_insecure_binary", adjusters)]), ]
+model_data <- droplevels(model_data)
+if (!nrow(model_data)) stop("No complete cases remain for the specified model.")
+valid_adjusters <- adjusters[vapply(model_data[adjusters], function(x) length(unique(x)) > 1, logical(1))]
+if (nlevels(model_data$water_insecure_binary) < 2 || nlevels(model_data$gov_performance_positive) < 2) {
+  stop("The exposure and outcome must each have two observed categories in the analytic sample.")
+}
+
+rhs <- c("water_insecure_binary", valid_adjusters)
+model_formula <- as.formula(
+  paste("I(gov_performance_positive == 'Well') ~", paste(rhs, collapse = " + "))
+)
+
+cat("Complete-case model sample:", nrow(model_data), "\n")
+cat("Adjusted model formula:", deparse(model_formula), "\n")
+```
+
+**Interpretation:** An odds ratio below 1.00 for water insecurity indicates that respondents who experienced water insecurity had lower odds of rating government performance on water and sanitation positively than respondents who never went without enough clean water. An odds ratio above 1.00 indicates higher odds. Statistical evidence should be judged using the 95% confidence interval and p-value shown in Table 3.
+
+```{r table3-logistic}
+model_design <- survey::svydesign(ids = ~1, weights = ~weight, data = model_data)
+model <- survey::svyglm(model_formula, family = quasibinomial(), design = model_design)
+
+model %>%
+  tbl_regression(
+    exponentiate = TRUE,
+    label = list(water_insecure_binary = "Experienced water insecurity")
+  ) %>%
+  bold_labels() %>%
+  bold_p(t = 0.05) %>%
+  modify_caption("**Table 3. Association between water insecurity and positive perceptions of government performance**") %>%
+  gtsummary::as_flex_table() %>%
+  flextable::set_table_properties(layout = "autofit", width = 1)
+```
+
+
+# Interpretation of regression results
+
+The following text uses the results provided for the model with **1,183 respondents**. The model was not run again when this text was added. If you change the data or model, check that the numbers in the text still match the table.
+
+## Water insecurity
+
+Water insecurity was clearly related to how people rated government performance. After taking the other variables into account, respondents who had experienced water insecurity had **70% lower odds** of rating performance well than those who had never gone without water (**adjusted OR 0.30, 95% CI 0.22-0.42; p < 0.001**). The confidence interval suggests between 58% and 78% lower odds. This refers to odds, not a 70% lower probability.
+
+This relationship was still present after including the other variables in the model. However, we cannot say from these results that water insecurity caused people to rate government performance badly.
+
+## Demographic characteristics and residence
+
+There was no clear adjusted evidence of an association for age (OR 1.01 per year, 95% CI 1.00-1.02; p = 0.2), women compared with men (OR 1.09, 95% CI 0.81-1.46; p = 0.6), or rural compared with urban residence (OR 1.10, 95% CI 0.73-1.66; p = 0.6). Confidence intervals and p-values should be read together: rounding the age confidence limit to 1.00 does not override the reported p-value. This does not mean that age, gender or residence has no relationship with people’s views. It means that this model did not provide clear evidence of such a relationship.
+
+## Province
+
+Compared with Harare, respondents in Masvingo had higher adjusted odds of a positive assessment (OR 2.37, 95% CI 1.22-4.62; p = 0.011). Mashonaland Central also had higher estimated odds (OR 1.95, 95% CI 1.00-3.79; p = 0.049), although this result lies close to the conventional threshold and its rounded lower confidence limit is 1.00. It should be interpreted cautiously, particularly given the number of province comparisons.
+
+The estimate for Manicaland was also above 1 (OR 1.91, 95% CI 1.00-3.65), but p = 0.051 did not meet the prespecified 0.05 threshold. There was no clear evidence of a difference from Harare for the remaining individual province contrasts. Each province is compared with Harare. These results do not compare every province with every other province, and they are not an overall test of provincial differences.
+
+## National economic conditions
+
+Compared with respondents describing national economic conditions as very bad, those describing them as fairly good had approximately twice the odds of a positive government-performance assessment (OR 2.04, 95% CI 1.20-3.47; p = 0.009). Those describing conditions as very good had 3.50 times the odds (95% CI 1.54-7.96; p = 0.003).
+
+The fairly bad category (OR 1.43, 95% CI 0.93-2.18; p = 0.10) and the neither-good-nor-bad category (OR 1.75, 95% CI 0.99-3.11; p = 0.056) did not show clear evidence of a difference from the very bad reference category. The odds ratios become larger across these categories, but a separate test for this trend was not carried out.
+
+## Personal living conditions and non-water deprivation
+
+None of the personal living-condition categories showed clear adjusted evidence of a difference from very bad living conditions; all reported confidence intervals included 1. The non-water deprivation score was also not clearly associated with positive assessments (OR 1.06 per one-point increase on the 0-4 scale, 95% CI 0.87-1.30; p = 0.5).
+
+Personal living conditions and deprivation showed differences in Table 2, but these relationships were not clear after adjustment. There may be overlap between the information captured by these variables and the other predictors. The use of weights and a slightly smaller sample may also contribute. This analysis cannot tell us which explanation is most important. A non-significant result is not proof that a variable has no relationship with the outcome, and it is not by itself a reason to remove that variable.
+
+# Discussion
+
+## Main findings
+
+The main finding is that people who experienced water insecurity were less likely, in terms of odds, to rate government performance on water and sanitation well. This relationship remained after accounting for the other variables in the model. The descriptive results showed a similar pattern. People who rated performance badly more often reported repeated water shortages.
+
+It is important to keep the meaning of the outcome clear. The question is about government performance in providing water and sanitation services. It is not a measure of overall government approval, political trust or voting preference. Also, the water question asks whether people went without enough clean water. It does not cover every aspect of water insecurity or sanitation access.
+
+## What might explain the findings?
+
+One possible explanation is that people judge water and sanitation services partly through their own daily experience. When a household often goes without enough water, its members may be less satisfied with how these services are provided. This explanation fits the pattern in the results, but the study did not directly test it. Other factors, including local conditions or a more general dissatisfaction, may also play a role.
+
+People who viewed national economic conditions more positively also tended to rate water and sanitation performance more positively. This suggests that views about a specific service may be connected with broader views about the country. However, the survey cannot tell us which view came first. Both may also be influenced by other factors that were not included in the model.
+
+## Differences between places and households
+
+Respondents in Masvingo had higher adjusted odds of a positive rating than those in Harare. The estimate for Mashonaland Central was also higher, although its p-value was close to 0.05. We should be careful not to give too much weight to this borderline result, especially because several provinces were compared.
+
+The analysis does not explain why these provincial differences exist. Infrastructure, service reliability and people’s expectations are possible areas to study further. They should not be presented as explanations already confirmed by this model.
+
+Residence, personal living conditions and non-water deprivation showed differences in the descriptive table, but there was no clear evidence of these relationships in the adjusted model. This is not unusual when several related variables are considered together. It does not mean that household circumstances or place of residence are unimportant. It means that their separate relationships were not clear in this particular model.
+
+## What do the findings suggest?
+
+The results suggest that people’s experience of water shortages deserves attention when studying their views on water and sanitation services. A useful next step would be to compare these survey responses with information on actual service availability, reliability and local infrastructure. This could help us understand how much of the relationship is connected with service conditions and how much may reflect other influences.
+
+The study does not show that a particular policy or investment would change public opinion. It is therefore better to use the findings to guide further investigation and monitoring, rather than to claim that a specific intervention will improve government ratings.
+
+## Strengths and limitations
+
+A useful part of this analysis is that the main exposure and outcome are closely related to the research question. The model also includes several demographic, geographic and socioeconomic variables. The deprivation score excludes water, so the water-insecurity item is not included again as part of an adjustment variable. This score is a study-specific measure, not the official five-item Lived Poverty Index.
+
+There are also some important limitations.
+
+First, the data were collected at one point in time. We cannot establish which factor came first or make a causal claim. Both water insecurity and government ratings were reported by the respondents, so the answers may also be affected by shared reporting influences.
+
+Second, the regression uses survey weights but does not include the full clustered and stratified sampling design. The confidence intervals and p-values should therefore be treated with caution until the full design is included.
+
+Third, the regression includes 1,183 of the original 1,200 respondents. Cases with missing information were excluded. If those respondents differ in important ways from the included respondents, the results may be affected.
+
+Fourth, the binary variables simplify the original answers. Someone who went without water once or twice is placed in the same exposure group as someone who always went without water. Similarly, the outcome combines fairly good and very good ratings, and combines fairly bad and very bad ratings. No further models were added to examine these differences.
+
+Fifth, education was not detected in the data preparation and was not included. Other unmeasured factors may also affect the results. The model assumes a straight-line relationship on the log-odds scale for age and deprivation, but this assumption was not checked in the reported analysis.
+
+Finally, Table 2 is unweighted, while the figure and regression use weights. These results are not directly interchangeable. Several category comparisons were also made, so findings close to p = 0.05 should not be treated as strong evidence on their own.
+
+# Conclusion
+
+Water insecurity was associated with lower odds of rating government performance on water and sanitation well in the supplied Zimbabwe Round 10 results. After adjustment, respondents who had experienced water insecurity had 70% lower odds of a positive rating than those who had not (OR 0.30, 95% CI 0.22-0.42).
+
+More positive views of national economic conditions were also associated with positive ratings. Some provincial differences were present. For age, gender, residence, personal living conditions and non-water deprivation, the adjusted model did not show clear evidence of an association.
+
+Overall, the findings suggest a connection between people’s experience of water shortages and how they view government performance in this area. They do not show that one caused the other. The full survey design should be included before the uncertainty estimates are treated as ready for publication.
